@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>حذف العدادات من الخريطة بناءً على تحديث ملف CSV</title>
+    <style>
+        #map { height: 500px; width: 100%; }
+        #controls { margin: 10px; }
+        button, input { margin: 5px; padding: 8px; }
+        #status { color: green; margin-top: 10px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <input type="file" id="folderInput" webkitdirectory directory multiple />
+        <button id="loadBtn">📂 تحميل المجلد وعرض العدادات</button>
+        <button id="watchBtn">👁️ بدء المراقبة التلقائية</button>
+        <button id="stopWatchBtn">⏹️ إيقاف المراقبة</button>
+        <span id="status"></span>
+    </div>
+    <div id="map"></div>
+
+    <script src="https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY&callback=initMap" async defer></script>
+    <script>
+        // --- متغيرات عامة ---
+        let map;
+        let markers = [];           // تخزين جميع العلامات الحالية
+        let markersMap = new Map(); // خريطة سريعة (رقم العداد -> marker)
+        let watchInterval = null;
+        let fileLastModified = new Map(); // تخزين آخر وقت تعديل لكل ملف
+        let currentFolderFiles = [];      // قائمة الملفات المختارة (كائنات File)
+
+        // --- تهيئة الخريطة (سيتم استدعاؤها بعد تحميل API) ---
+        function initMap() {
+            map = new google.maps.Map(document.getElementById("map"), {
+                center: { lat: 24.7136, lng: 46.6753 }, // الرياض مثلاً
+                zoom: 12,
+            });
+            document.getElementById("status").innerHTML = "الخريطة جاهزة، اختر مجلداً ثم اضغط تحميل.";
+        }
+
+        // --- دالة مساعدة لقراءة ملف CSV واستخراج أرقام العدادات (والإحداثيات إن وجدت) ---
+        // تقوم بإرجاع Promise بمصفوفة من الكائنات {id, lat, lng} (إذا وُجدت إحداثيات وإلا {id})
+        function parseCSV(file) {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const text = e.target.result;
+                    const lines = text.split(/\r?\n/);
+                    if (lines.length === 0) return resolve([]);
+                    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+                    const idCol = headers.findIndex(h => h.includes('id') || h === 'meter_id');
+                    const latCol = headers.findIndex(h => h === 'lat' || h === 'latitude');
+                    const lngCol = headers.findIndex(h => h === 'lng' || h === 'longitude');
+                    
+                    const meters = [];
+                    for (let i = 1; i < lines.length; i++) {
+                        const parts = lines[i].split(',');
+                        if (parts.length < 1) continue;
+                        const id = parts[idCol !== -1 ? idCol : 0]?.trim();
+                        if (!id) continue;
+                        let lat = null, lng = null;
+                        if (latCol !== -1 && lngCol !== -1 && parts[latCol] && parts[lngCol]) {
+                            lat = parseFloat(parts[latCol]);
+                            lng = parseFloat(parts[lngCol]);
+                        }
+                        meters.push({ id, lat, lng });
+                    }
+                    resolve(meters);
+                };
+                reader.readAsText(file, "UTF-8");
+            });
+        }
+
+        // --- عرض العدادات على الخريطة من جميع ملفات CSV في المجلد ---
+        async function loadAllMetersFromFolder(files) {
+            // حذف جميع العلامات الحالية
+            clearAllMarkers();
+            markers = [];
+            markersMap.clear();
+            fileLastModified.clear();
+            
+            let totalMeters = 0;
+            for (const file of files) {
+                if (!file.name.endsWith('.csv')) continue;
+                // تخزين وقت التعديل
+                fileLastModified.set(file.name, file.lastModified);
+                const meters = await parseCSV(file);
+                for (const meter of meters) {
+                    // إذا وُجدت إحداثيات في الملف نستخدمها، وإلا نستخدم إحداثيات افتراضية (تحتاج لتعديل)
+                    let position;
+                    if (meter.lat && meter.lng && !isNaN(meter.lat) && !isNaN(meter.lng)) {
+                        position = { lat: meter.lat, lng: meter.lng };
+                    } else {
+                        // لم يتم توفير إحداثيات -> يمكن وضع العداد في موقع افتراضي أو تجاهله
+                        console.warn(`العداد ${meter.id} ليس له إحداثيات، تم وضعه في مركز الخريطة افتراضياً.`);
+                        position = map.getCenter();
+                    }
+                    const marker = new google.maps.Marker({
+                        position: position,
+                        map: map,
+                        title: `عداد ${meter.id}`,
+                        icon: "http://maps.google.com/mapfiles/ms/icons/blue-dot.png"
+                    });
+                    markers.push(marker);
+                    markersMap.set(meter.id, marker);
+                    totalMeters++;
+                }
+            }
+            document.getElementById("status").innerHTML = `✅ تم تحميل ${totalMeters} عداداً من ${files.filter(f=>f.name.endsWith('.csv')).length} ملف CSV.`;
+        }
+
+        // --- حذف كل العلامات من الخريطة ---
+        function clearAllMarkers() {
+            for (let marker of markers) {
+                marker.setMap(null);
+            }
+            markers = [];
+            markersMap.clear();
+        }
+
+        // --- حذف عدد معين حسب رقمه ---
+        function deleteMeterById(meterId) {
+            if (markersMap.has(meterId)) {
+                const marker = markersMap.get(meterId);
+                marker.setMap(null);
+                markersMap.delete(meterId);
+                // إزالة من مصفوفة markers (فلترة)
+                const index = markers.findIndex(m => m === marker);
+                if (index !== -1) markers.splice(index, 1);
+                return true;
+            }
+            return false;
+        }
+
+        // --- مراقبة المجلد: فحص الملفات التي تغيرت منذ آخر مرة ---
+        async function checkForUpdates() {
+            if (!currentFolderFiles.length) return;
+            let anyChange = false;
+            const updatedFiles = [];
+            
+            // نعيد قراءة الملفات من خلال نفس عنصر الإدخال (لكن يجب أن نحتفظ بمرجع إلى الملفات الأصلية)
+            // نظرًا لأن كائن File لا يمكن تحديثه، سنحتاج إلى إعادة تحميل الملفات من نفس المدخل
+            // لكن webkitdirectory لا يعيد تحميل الملفات المحدثة تلقائياً، لذا نطلب من المستخدم إعادة تحديد المجلد 
+            // للحصول على نسخة جديدة. هذا قيد أمني للمتصفح.
+            // لذلك سأقوم بدلاً من ذلك بجعل المستخدم ينقر "تحديث يدوي" أو نستخدم File System Access API (مدعوم جزئياً).
+            // لتقديم حل عملي سهل، سأعتمد على **المراقبة اليدوية عبر زر "تحديث"** مع إعادة اختيار المجلد.
+            // لكن يمكننا محاكاة المراقبة بأن نطلب من المستخدم كل فترة إعادة تحميل المجلد.
+            // الطريقة الأسهل: المستخدم يضغط زر "فحص التحديثات" ويختار المجلد نفسه من جديد.
+            
+            // نظراً لقيود الأمان، سأعطي حلاً بديلاً: زر "حذف العدادات من الملفات المحدثة" 
+            // يسمح للمستخدم باختيار ملف CSV محدد (أو المجدد) ويحذف العدادات الموجودة فيه.
+        }
+
+        // --- الحل العملي المعروض للمستخدم: ---
+        // 1. تحميل المجلد وعرض العدادات (أول مرة).
+        // 2. زر "حذف بناءً على ملف محدث": يسمح للمستخدم باختيار ملف CSV (الذي تم تحديثه) 
+        //    ثم يقرأ أرقام العدادات منه ويحذفها من الخريطة.
+
+        function setupPracticalSolution() {
+            document.getElementById("loadBtn").onclick = async () => {
+                const files = Array.from(document.getElementById("folderInput").files);
+                if (files.length === 0) {
+                    alert("الرجاء اختيار مجلد أولاً.");
+                    return;
+                }
+                currentFolderFiles = files.filter(f => f.name.endsWith('.csv'));
+                if (currentFolderFiles.length === 0) {
+                    alert("المجلد لا يحتوي على ملفات CSV.");
+                    return;
+                }
+                await loadAllMetersFromFolder(currentFolderFiles);
+            };
+
+            // زر لاختيار ملف CSV تم تحديثه يدوياً وحذف العدادات الموجودة فيه
+            const deleteBtn = document.createElement("button");
+            deleteBtn.textContent = "🗑️ حذف عدادات ملف CSV تم تحديثه";
+            deleteBtn.style.background = "#d9534f";
+            deleteBtn.style.color = "white";
+            document.getElementById("controls").appendChild(deleteBtn);
+            
+            const fileInputForUpdate = document.createElement("input");
+            fileInputForUpdate.type = "file";
+            fileInputForUpdate.accept = ".csv";
+            fileInputForUpdate.style.display = "none";
+            document.getElementById("controls").appendChild(fileInputForUpdate);
+            
+            deleteBtn.onclick = () => {
+                fileInputForUpdate.click();
+            };
+            
+            fileInputForUpdate.onchange = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const meters = await parseCSV(file);
+                let deletedCount = 0;
+                for (const meter of meters) {
+                    if (deleteMeterById(meter.id)) deletedCount++;
+                }
+                document.getElementById("status").innerHTML = `✔️ تم حذف ${deletedCount} عداداً من الخريطة بناءً على ملف "${file.name}".`;
+                fileInputForUpdate.value = ""; // إعادة تعيين
+            };
+        }
+
+        // --- بدء الخريطة ---
+        window.initMap = function() {
+            initMap();
+            setupPracticalSolution();
+        };
+        
+        // إذا فشل تحميل API (تأكد من وضع مفتاح صحيح)
+        window.onload = () => {
+            if (typeof google === 'undefined') {
+                document.getElementById("status").innerHTML = "❌ لم يتم تحميل Google Maps API. تأكد من وجود مفتاح API صحيح.";
+            }
+        };
+    </script>
+</body>
+</html>
